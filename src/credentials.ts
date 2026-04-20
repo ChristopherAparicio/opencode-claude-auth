@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -16,6 +17,19 @@ import {
 } from "./keychain.ts"
 import { resetExcludedBetas } from "./betas.ts"
 import { log } from "./logger.ts"
+
+/**
+ * Centralized audit log — shared with refresh service and usage bar.
+ */
+function audit(action: string, profile: string, detail: string = ""): void {
+  try {
+    const path = join(homedir(), ".local", "share", "opencode", "credentials-audit.log")
+    const ts = new Date().toISOString()
+    appendFileSync(path, `${ts} | plugin:${process.pid} | ${action} | ${profile} | ${detail}\n`)
+  } catch {
+    // Non-fatal
+  }
+}
 
 export type { ClaudeCredentials } from "./keychain.ts"
 export type { ClaudeAccount } from "./keychain.ts"
@@ -140,6 +154,7 @@ export function syncAuthJson(creds: ClaudeCredentials): void {
   for (const authPath of getAuthJsonPaths()) {
     try {
       syncToPath(authPath, creds)
+      audit("auth_json_write", "active", `token=...${creds.accessToken.slice(-12)}`)
       log("sync_auth_json", { path: authPath, success: true })
     } catch (err) {
       log("sync_auth_json", {
@@ -221,6 +236,8 @@ export function refreshIfNeeded(
   const fromKeychain = refreshAccount(target.source)
   if (fromKeychain && fromKeychain.expiresAt > Date.now() + 60_000) {
     target.credentials = fromKeychain
+    const h = ((fromKeychain.expiresAt - Date.now()) / 1000 / 3600).toFixed(1)
+    audit("keychain_read_fresh", target.source, `+${h}h token=...${fromKeychain.accessToken.slice(-12)}`)
     log("token_refreshed_from_keychain", {
       source: target.source,
       expiresAt: fromKeychain.expiresAt,
@@ -232,6 +249,7 @@ export function refreshIfNeeded(
     source: target.source,
     message: "Token expired and no fresh token in Keychain. Waiting for refresh service.",
   })
+  audit("credentials_expired", target.source, "no fresh token in Keychain")
   return null
 }
 
