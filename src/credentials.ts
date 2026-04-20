@@ -18,6 +18,29 @@ import {
 import { resetExcludedBetas } from "./betas.ts"
 import { log } from "./logger.ts"
 
+/**
+ * Find a usable Node.js binary. process.execPath may point to Bun or
+ * the OpenCode binary when running inside OpenCode, so we look for
+ * a real Node.js binary on disk first.
+ */
+function findNodeBinary(): string {
+  // If process.execPath ends with "node", it's likely real Node.js
+  if (/\bnode(\.exe)?$/.test(process.execPath)) return process.execPath
+
+  // Common paths on macOS (Homebrew) and Linux
+  const candidates = [
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+    "/usr/bin/node",
+  ]
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+
+  // Fallback: hope it's on PATH (will fail if it's Bun)
+  return process.execPath
+}
+
 export type { ClaudeCredentials } from "./keychain.ts"
 export type { ClaudeAccount } from "./keychain.ts"
 
@@ -215,7 +238,10 @@ export function refreshViaOAuth(
 
   try {
     log("refresh_started", { source: "oauth" })
-    const result = execFileSync(process.execPath, ["-e", script], {
+    // Use an explicit Node.js binary path. In OpenCode (which runs on Bun),
+    // process.execPath points to the OpenCode binary, not Node.js.
+    const nodeBin = process.env.NODE_PATH_OVERRIDE ?? findNodeBinary()
+    const result = execFileSync(nodeBin, ["-e", script], {
       input: refreshToken,
       timeout: 15_000,
       encoding: "utf-8",
@@ -298,6 +324,9 @@ export function refreshIfNeeded(
   const refreshed = refreshAccount(target.source)
   if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
     target.credentials = refreshed
+    // Persist the refreshed credentials so they survive process restarts.
+    writeBackCredentials(target.source, refreshed)
+    syncAuthJson(refreshed)
     return refreshed
   }
 

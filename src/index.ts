@@ -155,8 +155,6 @@ export function buildRequestHeaders(
   return headers
 }
 
-const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
-
 const plugin: Plugin = async () => {
   initLogger()
 
@@ -200,16 +198,9 @@ const plugin: Plugin = async () => {
       )
     }
 
-    // Keep auth.json synced with current credentials (no refresh triggered)
-    const syncTimer = setInterval(() => {
-      try {
-        const creds = getCredentialsForSync()
-        if (creds) syncAuthJson(creds)
-      } catch {
-        // Non-fatal
-      }
-    }, SYNC_INTERVAL)
-    syncTimer.unref()
+    // auth.json is written once at startup (above). No periodic sync needed.
+    // A previous sync timer caused stale in-memory tokens to overwrite fresh
+    // tokens written by other instances or by manual refresh.
   } else {
     log("plugin_init_no_accounts", { reason: "no credentials found" })
     console.warn(
