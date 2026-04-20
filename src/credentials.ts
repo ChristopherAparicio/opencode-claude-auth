@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { homedir, tmpdir } from "node:os"
@@ -17,6 +18,73 @@ import {
 } from "./keychain.ts"
 import { resetExcludedBetas } from "./betas.ts"
 import { log } from "./logger.ts"
+
+const REFRESH_LOCK_PATH = join(
+  homedir(),
+  ".local",
+  "share",
+  "opencode",
+  ".claude-refresh.lock",
+)
+const REFRESH_LOCK_TIMEOUT_MS = 20_000
+
+/**
+ * Acquire a file-based lock for token refresh. Returns true if this process
+ * acquired the lock, false if another process holds it. The lock file contains
+ * the PID and timestamp so stale locks can be detected.
+ */
+function acquireRefreshLock(): boolean {
+  try {
+    // Check if lock exists and is still valid
+    if (existsSync(REFRESH_LOCK_PATH)) {
+      const raw = readFileSync(REFRESH_LOCK_PATH, "utf-8").trim()
+      try {
+        const lock = JSON.parse(raw) as { pid: number; ts: number }
+        const age = Date.now() - lock.ts
+        if (age < REFRESH_LOCK_TIMEOUT_MS) {
+          // Lock is still valid — another process is refreshing
+          log("refresh_lock_held", {
+            otherPid: lock.pid,
+            ageMs: age,
+          })
+          return false
+        }
+        // Lock is stale — take it over
+        log("refresh_lock_stale", { otherPid: lock.pid, ageMs: age })
+      } catch {
+        // Malformed lock file — take it over
+      }
+    }
+    const dir = dirname(REFRESH_LOCK_PATH)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(
+      REFRESH_LOCK_PATH,
+      JSON.stringify({ pid: process.pid, ts: Date.now() }),
+      { encoding: "utf-8", mode: 0o600 },
+    )
+    log("refresh_lock_acquired", { pid: process.pid })
+    return true
+  } catch {
+    // If we can't create the lock, proceed anyway (better than deadlock)
+    return true
+  }
+}
+
+function releaseRefreshLock(): void {
+  try {
+    if (existsSync(REFRESH_LOCK_PATH)) {
+      const raw = readFileSync(REFRESH_LOCK_PATH, "utf-8").trim()
+      const lock = JSON.parse(raw) as { pid: number }
+      // Only remove if we own it
+      if (lock.pid === process.pid) {
+        unlinkSync(REFRESH_LOCK_PATH)
+        log("refresh_lock_released", { pid: process.pid })
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+}
 
 /**
  * Find a usable Node.js binary. process.execPath may point to Bun or
@@ -308,34 +376,66 @@ export function refreshIfNeeded(
     expiresIn: creds.expiresAt - Date.now(),
   })
 
-  // Try direct OAuth refresh first (zero LLM tokens consumed)
-  if (creds.refreshToken) {
-    const oauthCreds = refreshViaOAuth(creds.refreshToken)
-    if (oauthCreds && oauthCreds.expiresAt > Date.now() + 60_000) {
-      target.credentials = oauthCreds
-      writeBackCredentials(target.source, oauthCreds)
-      return oauthCreds
+  // Try to acquire the refresh lock. If another instance is already refreshing,
+  // wait briefly and re-read from Keychain (it may have fresh tokens by now).
+  if (!acquireRefreshLock()) {
+    log("refresh_waiting", { source: target.source })
+    // Wait a bit for the other instance to finish
+    try {
+      execFileSync("/bin/sleep", ["2"], { timeout: 5000, stdio: "ignore" })
+    } catch {
+      // ignore
+    }
+    // Re-read from Keychain — the other instance should have written fresh tokens
+    const freshFromKeychain = refreshAccount(target.source)
+    if (freshFromKeychain && freshFromKeychain.expiresAt > Date.now() + 60_000) {
+      target.credentials = freshFromKeychain
+      log("refresh_from_other_instance", {
+        source: target.source,
+        expiresAt: freshFromKeychain.expiresAt,
+      })
+      return freshFromKeychain
+    }
+    // Other instance may have failed — try to acquire lock and refresh ourselves
+    if (!acquireRefreshLock()) {
+      log("refresh_lock_still_held", { source: target.source })
+      return null
     }
   }
 
-  // Fall back to CLI-based refresh (consumes Haiku tokens)
-  log("refresh_fallback_cli", { source: target.source })
-  refreshViaCli()
-  const refreshed = refreshAccount(target.source)
-  if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
-    target.credentials = refreshed
-    // Persist the refreshed credentials so they survive process restarts.
-    writeBackCredentials(target.source, refreshed)
-    syncAuthJson(refreshed)
-    return refreshed
-  }
+  try {
+    // Try direct OAuth refresh first (zero LLM tokens consumed)
+    if (creds.refreshToken) {
+      const oauthCreds = refreshViaOAuth(creds.refreshToken)
+      if (oauthCreds && oauthCreds.expiresAt > Date.now() + 60_000) {
+        target.credentials = oauthCreds
+        writeBackCredentials(target.source, oauthCreds)
+        syncAuthJson(oauthCreds)
+        return oauthCreds
+      }
+    }
 
-  log("refresh_exhausted", {
-    source: target.source,
-    hadCredentials: !!refreshed,
-    expiresAt: refreshed?.expiresAt,
-  })
-  return null
+    // Fall back to CLI-based refresh (consumes Haiku tokens)
+    log("refresh_fallback_cli", { source: target.source })
+    refreshViaCli()
+    const refreshed = refreshAccount(target.source)
+    if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
+      target.credentials = refreshed
+      // Persist the refreshed credentials so they survive process restarts.
+      writeBackCredentials(target.source, refreshed)
+      syncAuthJson(refreshed)
+      return refreshed
+    }
+
+    log("refresh_exhausted", {
+      source: target.source,
+      hadCredentials: !!refreshed,
+      expiresAt: refreshed?.expiresAt,
+    })
+    return null
+  } finally {
+    releaseRefreshLock()
+  }
 }
 
 /**
@@ -379,6 +479,19 @@ export function getCachedCredentials(): ClaudeCredentials | null {
     source: account.source,
     reason: cached ? "stale or expiring" : "empty",
   })
+
+  // Before triggering a refresh, re-read from Keychain — another instance
+  // may have already refreshed the token.
+  const fromKeychain = refreshAccount(account.source)
+  if (fromKeychain && fromKeychain.expiresAt > now + 60_000) {
+    log("cache_refreshed_from_keychain", {
+      source: account.source,
+      expiresAt: fromKeychain.expiresAt,
+    })
+    account.credentials = fromKeychain
+    accountCacheMap.set(account.source, { creds: fromKeychain, cachedAt: now })
+    return fromKeychain
+  }
 
   const fresh = refreshIfNeeded(account)
   if (!fresh) {
