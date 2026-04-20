@@ -1,13 +1,11 @@
-import { execFileSync, execSync } from "node:child_process"
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs"
-import { homedir, tmpdir } from "node:os"
+import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import {
   readAllClaudeAccounts,
@@ -18,96 +16,6 @@ import {
 } from "./keychain.ts"
 import { resetExcludedBetas } from "./betas.ts"
 import { log } from "./logger.ts"
-
-const REFRESH_LOCK_PATH = join(
-  homedir(),
-  ".local",
-  "share",
-  "opencode",
-  ".claude-refresh.lock",
-)
-const REFRESH_LOCK_TIMEOUT_MS = 20_000
-
-/**
- * Acquire a file-based lock for token refresh. Returns true if this process
- * acquired the lock, false if another process holds it. The lock file contains
- * the PID and timestamp so stale locks can be detected.
- */
-function acquireRefreshLock(): boolean {
-  try {
-    // Check if lock exists and is still valid
-    if (existsSync(REFRESH_LOCK_PATH)) {
-      const raw = readFileSync(REFRESH_LOCK_PATH, "utf-8").trim()
-      try {
-        const lock = JSON.parse(raw) as { pid: number; ts: number }
-        const age = Date.now() - lock.ts
-        if (age < REFRESH_LOCK_TIMEOUT_MS) {
-          // Lock is still valid — another process is refreshing
-          log("refresh_lock_held", {
-            otherPid: lock.pid,
-            ageMs: age,
-          })
-          return false
-        }
-        // Lock is stale — take it over
-        log("refresh_lock_stale", { otherPid: lock.pid, ageMs: age })
-      } catch {
-        // Malformed lock file — take it over
-      }
-    }
-    const dir = dirname(REFRESH_LOCK_PATH)
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    writeFileSync(
-      REFRESH_LOCK_PATH,
-      JSON.stringify({ pid: process.pid, ts: Date.now() }),
-      { encoding: "utf-8", mode: 0o600 },
-    )
-    log("refresh_lock_acquired", { pid: process.pid })
-    return true
-  } catch {
-    // If we can't create the lock, proceed anyway (better than deadlock)
-    return true
-  }
-}
-
-function releaseRefreshLock(): void {
-  try {
-    if (existsSync(REFRESH_LOCK_PATH)) {
-      const raw = readFileSync(REFRESH_LOCK_PATH, "utf-8").trim()
-      const lock = JSON.parse(raw) as { pid: number }
-      // Only remove if we own it
-      if (lock.pid === process.pid) {
-        unlinkSync(REFRESH_LOCK_PATH)
-        log("refresh_lock_released", { pid: process.pid })
-      }
-    }
-  } catch {
-    // Non-fatal
-  }
-}
-
-/**
- * Find a usable Node.js binary. process.execPath may point to Bun or
- * the OpenCode binary when running inside OpenCode, so we look for
- * a real Node.js binary on disk first.
- */
-function findNodeBinary(): string {
-  // If process.execPath ends with "node", it's likely real Node.js
-  if (/\bnode(\.exe)?$/.test(process.execPath)) return process.execPath
-
-  // Common paths on macOS (Homebrew) and Linux
-  const candidates = [
-    "/opt/homebrew/bin/node",
-    "/usr/local/bin/node",
-    "/usr/bin/node",
-  ]
-  for (const p of candidates) {
-    if (existsSync(p)) return p
-  }
-
-  // Fallback: hope it's on PATH (will fail if it's Bun)
-  return process.execPath
-}
 
 export type { ClaudeCredentials } from "./keychain.ts"
 export type { ClaudeAccount } from "./keychain.ts"
@@ -281,84 +189,15 @@ export function parseOAuthResponse(
 export function refreshViaOAuth(
   refreshToken: string,
 ): ClaudeCredentials | null {
-  // Use a Node subprocess to perform the HTTP request synchronously.
-  // The refresh token is passed via stdin to avoid exposure in process args.
-  const script = `
-    process.stdin.resume();
-    let input = '';
-    process.stdin.on('data', c => input += c);
-    process.stdin.on('end', () => {
-      const body = new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: '${OAUTH_CLIENT_ID}',
-        refresh_token: input.trim()
-      });
-      fetch('${OAUTH_TOKEN_URL}', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString()
-      })
-      .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
-      .then(d => { process.stdout.write(JSON.stringify(d)); })
-      .catch(e => { process.stdout.write(JSON.stringify({ error: String(e) })); process.exit(1); });
-    });
-  `
-
-  try {
-    log("refresh_started", { source: "oauth" })
-    // Use an explicit Node.js binary path. In OpenCode (which runs on Bun),
-    // process.execPath points to the OpenCode binary, not Node.js.
-    const nodeBin = process.env.NODE_PATH_OVERRIDE ?? findNodeBinary()
-    const result = execFileSync(nodeBin, ["-e", script], {
-      input: refreshToken,
-      timeout: 15_000,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "ignore"],
-    })
-
-    const creds = parseOAuthResponse(result, refreshToken)
-    if (!creds) {
-      log("refresh_failed", {
-        source: "oauth",
-        error: "no access_token in response",
-      })
-      return null
-    }
-
-    log("refresh_success", { source: "oauth" })
-    return creds
-  } catch (err) {
-    log("refresh_failed", {
-      source: "oauth",
-      error: err instanceof Error ? err.message : String(err),
-    })
-    return null
-  }
+  // Refresh is disabled in the plugin. A dedicated LaunchAgent service
+  // handles token refresh to avoid multi-instance race conditions.
+  log("refresh_disabled", { source: "oauth", reason: "delegated to refresh service" })
+  return null
 }
 
 function refreshViaCli(): void {
-  const maxAttempts = 2
-  for (let i = 0; i < maxAttempts; i++) {
-    log("refresh_started", { source: "cli", attempt: i + 1 })
-    try {
-      execSync("claude -p . --model haiku", {
-        timeout: 60_000,
-        encoding: "utf-8",
-        env: { ...process.env, TERM: "dumb" },
-        stdio: "ignore",
-        cwd: tmpdir(),
-      })
-      log("refresh_success", { source: "cli" })
-      return
-    } catch (err) {
-      log("refresh_failed", {
-        source: "cli",
-        attempt: i + 1,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      // Non-fatal: retry once, then give up
-    }
-  }
+  // Refresh is disabled in the plugin.
+  log("refresh_disabled", { source: "cli", reason: "delegated to refresh service" })
 }
 
 export function refreshIfNeeded(
@@ -370,72 +209,30 @@ export function refreshIfNeeded(
   const creds = target.credentials
   if (creds.expiresAt > Date.now() + 60_000) return creds
 
-  log("refresh_needed", {
+  // Token is expired or about to expire.
+  // DO NOT refresh here — a dedicated LaunchAgent service handles refresh.
+  // Just re-read from Keychain in case the service already refreshed.
+  log("token_expired_rereading_keychain", {
     source: target.source,
     expiresAt: creds.expiresAt,
     expiresIn: creds.expiresAt - Date.now(),
   })
 
-  // Try to acquire the refresh lock. If another instance is already refreshing,
-  // wait briefly and re-read from Keychain (it may have fresh tokens by now).
-  if (!acquireRefreshLock()) {
-    log("refresh_waiting", { source: target.source })
-    // Wait a bit for the other instance to finish
-    try {
-      execFileSync("/bin/sleep", ["2"], { timeout: 5000, stdio: "ignore" })
-    } catch {
-      // ignore
-    }
-    // Re-read from Keychain — the other instance should have written fresh tokens
-    const freshFromKeychain = refreshAccount(target.source)
-    if (freshFromKeychain && freshFromKeychain.expiresAt > Date.now() + 60_000) {
-      target.credentials = freshFromKeychain
-      log("refresh_from_other_instance", {
-        source: target.source,
-        expiresAt: freshFromKeychain.expiresAt,
-      })
-      return freshFromKeychain
-    }
-    // Other instance may have failed — try to acquire lock and refresh ourselves
-    if (!acquireRefreshLock()) {
-      log("refresh_lock_still_held", { source: target.source })
-      return null
-    }
-  }
-
-  try {
-    // Try direct OAuth refresh first (zero LLM tokens consumed)
-    if (creds.refreshToken) {
-      const oauthCreds = refreshViaOAuth(creds.refreshToken)
-      if (oauthCreds && oauthCreds.expiresAt > Date.now() + 60_000) {
-        target.credentials = oauthCreds
-        writeBackCredentials(target.source, oauthCreds)
-        syncAuthJson(oauthCreds)
-        return oauthCreds
-      }
-    }
-
-    // Fall back to CLI-based refresh (consumes Haiku tokens)
-    log("refresh_fallback_cli", { source: target.source })
-    refreshViaCli()
-    const refreshed = refreshAccount(target.source)
-    if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
-      target.credentials = refreshed
-      // Persist the refreshed credentials so they survive process restarts.
-      writeBackCredentials(target.source, refreshed)
-      syncAuthJson(refreshed)
-      return refreshed
-    }
-
-    log("refresh_exhausted", {
+  const fromKeychain = refreshAccount(target.source)
+  if (fromKeychain && fromKeychain.expiresAt > Date.now() + 60_000) {
+    target.credentials = fromKeychain
+    log("token_refreshed_from_keychain", {
       source: target.source,
-      hadCredentials: !!refreshed,
-      expiresAt: refreshed?.expiresAt,
+      expiresAt: fromKeychain.expiresAt,
     })
-    return null
-  } finally {
-    releaseRefreshLock()
+    return fromKeychain
   }
+
+  log("credentials_expired", {
+    source: target.source,
+    message: "Token expired and no fresh token in Keychain. Waiting for refresh service.",
+  })
+  return null
 }
 
 /**
